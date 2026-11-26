@@ -1,0 +1,37 @@
+-- CAKECRAFT: Supabase schema + RLS. SQL Editor'da ishga tushiring.
+create type role_t as enum ('user','admin','super_admin');
+create type status_t as enum ('new','preparing','courier','delivered','cancelled');
+create table profiles(id uuid primary key references auth.users on delete cascade,name text,phone text,tg_id bigint unique,role role_t not null default 'user',blocked bool not null default false,cashback numeric not null default 0,created_at timestamptz default now());
+create table products(id uuid primary key default gen_random_uuid(),name text not null,category text not null,price_per_kg numeric not null check(price_per_kg>=0),stock int not null default 0,express bool default false,hidden bool default false,prep_minutes int default 60,ingredients text,allergens text,image_url text,created_at timestamptz default now());
+create table orders(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles on delete restrict,items jsonb not null,total numeric not null,delivery text not null check(delivery in('courier','pickup')),address text,lat float8,lng float8,deliver_at timestamptz,payment text not null,promo text,status status_t not null default 'new',ref_image text,created_at timestamptz default now());
+create table special_dates(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles on delete cascade,title text not null,date date not null,remind_days int default 3);
+create table promo_codes(code text primary key,percent int check(percent between 1 and 100),active bool default true);
+create table settings(key text primary key,value jsonb not null);
+create table audit_logs(id bigint generated always as identity primary key,actor uuid,action text,meta jsonb,at timestamptz default now());
+create function my_role() returns role_t language sql stable security definer set search_path=public as $$select role from profiles where id=auth.uid()$$;
+create function handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$begin insert into profiles(id,name) values(new.id,new.raw_user_meta_data->>'name');return new;end$$;
+create trigger on_signup after insert on auth.users for each row execute function handle_new_user();
+-- Foydalanuvchi o'z rolini/keshbekini o'zgartira olmasin
+create function lock_profile() returns trigger language plpgsql as $$begin if my_role()<>'super_admin' and (new.role<>old.role or new.cashback<>old.cashback or new.blocked<>old.blocked) then raise exception 'forbidden';end if;return new;end$$;
+create trigger t_lock before update on profiles for each row execute function lock_profile();
+alter table profiles enable row level security;alter table products enable row level security;alter table orders enable row level security;alter table special_dates enable row level security;alter table promo_codes enable row level security;alter table settings enable row level security;alter table audit_logs enable row level security;
+create policy p_sel on profiles for select using(id=auth.uid() or my_role()='super_admin');
+create policy p_upd on profiles for update using(id=auth.uid() or my_role()='super_admin');
+create policy pr_sel on products for select using(not hidden or my_role() in('admin','super_admin'));
+create policy pr_all on products for all using(my_role() in('admin','super_admin')) with check(my_role() in('admin','super_admin'));
+create policy o_sel on orders for select using(user_id=auth.uid() or my_role() in('admin','super_admin'));
+create policy o_ins on orders for insert with check(user_id=auth.uid() and status='new' and not (select blocked from profiles where id=auth.uid()));
+create policy o_upd on orders for update using(my_role() in('admin','super_admin'));
+create policy d_all on special_dates for all using(user_id=auth.uid()) with check(user_id=auth.uid());
+create policy pc_sel on promo_codes for select using(active);
+create policy pc_all on promo_codes for all using(my_role()='super_admin') with check(my_role()='super_admin');
+create policy s_sel on settings for select using(true);
+create policy s_all on settings for all using(my_role()='super_admin') with check(my_role()='super_admin');
+create policy a_sel on audit_logs for select using(my_role()='super_admin');
+create policy a_ins on audit_logs for insert with check(auth.uid()=actor);
+alter publication supabase_realtime add table orders;
+insert into storage.buckets(id,name,public) values('cakes','cakes',true),('refs','refs',false) on conflict do nothing;
+create policy st_cakes_w on storage.objects for all using(bucket_id='cakes' and my_role() in('admin','super_admin')) with check(bucket_id='cakes' and my_role() in('admin','super_admin'));
+create policy st_cakes_r on storage.objects for select using(bucket_id='cakes');
+create policy st_refs_w on storage.objects for insert with check(bucket_id='refs' and auth.uid() is not null);
+create policy st_refs_r on storage.objects for select using(bucket_id='refs' and (my_role() in('admin','super_admin') or owner=auth.uid()));
